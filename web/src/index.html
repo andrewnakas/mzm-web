@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- The real boundary for "your ROM never leaves this machine" is this header,
+     not the JS wrapper further down. The browser enforces it: no script on this
+     page can open a connection to any other origin, even if it tries, and there
+     is no race to win at startup. connect-src 'self' is what lets the page
+     fetch its own mzm.wasm; blob: and data: are for the URLs it makes from the
+     file you pick. form-action 'none' means nothing can be POSTed anywhere. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self' blob: data:; media-src 'none'; font-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Metroid: Zero Mission — bring your own ROM</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b0d10; --fg:#e7ebf0; --dim:#8b94a3;
+          --accent:#d94f3d; --panel:#15181d; --line:#262b33; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:16px; }
+  h1 { font-size:17px; font-weight:600; margin:0 0 2px; letter-spacing:.01em; }
+  .sub { color:var(--dim); font-size:12px; margin:0 0 14px; }
+  /* The screen is laid out permanently and is never styled from JS: a run that
+     renders perfectly into a 0x0 canvas looks exactly like a working run. */
+  #screen { display:block; width:min(960px, calc(100vw - 32px)); aspect-ratio:3/2;
+    background:#000; border:1px solid var(--line); border-radius:4px;
+    image-rendering:pixelated; }
+  #wrap { position:relative; width:min(960px, calc(100vw - 32px)); }
+  #overlay { position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:12px; text-align:center;
+    background:rgba(11,13,16,.93); border-radius:4px; padding:20px; }
+  #overlay.gone { display:none; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    width:min(960px, calc(100vw - 32px)); margin-top:10px; }
+  button, label.btn { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+    border-radius:4px; padding:6px 11px; font:inherit; font-size:13px; cursor:pointer; }
+  button:hover, label.btn:hover { border-color:#3a414d; }
+  button:disabled { opacity:.45; cursor:default; }
+  #status { color:var(--dim); font-size:12px; margin-left:auto; text-align:right; }
+  #msg { color:var(--accent); font-size:13px; min-height:18px; }
+  input[type=file] { display:none; }
+  .keys { color:var(--dim); font-size:12px; margin-top:12px;
+    width:min(960px, calc(100vw - 32px)); border-top:1px solid var(--line); padding-top:10px; }
+  .keys b { color:var(--fg); font-weight:500; }
+  code { background:var(--panel); padding:1px 4px; border-radius:3px; }
+</style>
+</head>
+<body>
+
+<h1>Metroid: Zero Mission</h1>
+<p class="sub">Your own cartridge dump, read in this tab. Nothing is uploaded.</p>
+
+<div id="wrap">
+  <canvas id="screen" width="240" height="160"></canvas>
+  <div id="overlay">
+    <div><strong>Choose your Metroid: Zero Mission ROM</strong></div>
+    <div style="color:var(--dim);font-size:12px;max-width:34em">
+      The file is read with the File API straight into the emulator's memory in
+      this tab. This page has no server component and cannot reach any other
+      origin — see the Content-Security-Policy in its source.
+    </div>
+    <label class="btn" for="rom">Choose ROM file…</label>
+    <input type="file" id="rom" accept=".gba,.bin">
+    <div style="color:var(--dim);font-size:12px">…or drop the file anywhere on this page</div>
+    <div id="msg"></div>
+  </div>
+</div>
+
+<div class="bar">
+  <button id="pause" disabled>Pause</button>
+  <button id="reset" disabled>Reset</button>
+  <button id="sound" disabled>Sound: off</button>
+  <button id="savestate" disabled>Save state</button>
+  <button id="loadstate" disabled>Load state</button>
+  <button id="forget">Forget stored ROM</button>
+  <span id="status">no ROM</span>
+</div>
+
+<div class="keys">
+  <b>Arrow keys</b> move · <b>X</b> A (jump) · <b>Z</b> B (shoot) ·
+  <b>A</b> / <b>S</b> L / R · <b>Enter</b> Start · <b>Shift</b> Select ·
+  <b>P</b> pause. A standard gamepad works too (untested).
+  Your save is kept in this browser under this site's storage; <code>Forget stored ROM</code>
+  clears the cached ROM only.
+</div>
+
+<script>
+/* ------------------------------------------------------------------ network
+ * Belt and braces behind the CSP above. The CSP is the boundary that actually
+ * holds; this wrapper exists only so the page can *log* an attempt, which makes
+ * a test able to say "nothing tried" rather than "nothing got through".
+ */
+(function () {
+  const log = [];
+  window.__mzmNet = log;
+  const sameOrigin = (u) => {
+    try {
+      const s = String(u);
+      if (s.startsWith('blob:') || s.startsWith('data:')) return true;
+      return new URL(s, location.href).origin === location.origin;
+    } catch (e) { return false; }
+  };
+  const rf = window.fetch ? window.fetch.bind(window) : null;
+  if (rf) {
+    window.fetch = function (input, init) {
+      const u = (input && input.url) || input;
+      if (!sameOrigin(u)) {
+        log.push({ kind: 'fetch', url: String(u) });
+        return Promise.resolve(new Response('', { status: 403, statusText: 'blocked' }));
+      }
+      return rf(input, init);
+    };
+  }
+  const ro = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (m, u) {
+    if (!sameOrigin(u)) { log.push({ kind: 'xhr', url: String(u) }); throw new Error('blocked'); }
+    return ro.apply(this, arguments);
+  };
+  const RWS = window.WebSocket;
+  if (RWS) {
+    window.WebSocket = function (u) { log.push({ kind: 'ws', url: String(u) }); throw new Error('blocked'); };
+  }
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon = function (u) { log.push({ kind: 'beacon', url: String(u) }); return false; };
+  }
+  /* Counting AudioContext construction is how "muted" is asserted: muted here
+     means no audio graph exists at all, not a gain node at zero. */
+  window.__mzmAudioCtxCount = 0;
+  ['AudioContext', 'webkitAudioContext'].forEach(function (n) {
+    const C = window[n];
+    if (!C) return;
+    function Wrapped() {
+      window.__mzmAudioCtxCount++;
+      return new C(...arguments);
+    }
+    Wrapped.prototype = C.prototype;
+    window[n] = Wrapped;
+    window['__mzmReal' + n] = C;
+  });
+})();
+</script>
+
+<script src="mzm.js"></script>
+<script>
+(async function () {
+  'use strict';
+
+  const q = new URLSearchParams(location.search);
+  const NO_FLUSH = q.get('nosaveflush') === '1';   // negative control for the save test
+  const AUTOSTART = q.get('autostart') === '1';    // resume a cached ROM without a click
+
+  const cv = document.getElementById('screen');
+  const ctx = cv.getContext('2d', { alpha: false });
+  const overlay = document.getElementById('overlay');
+  const statusEl = document.getElementById('status');
+  const msgEl = document.getElementById('msg');
+
+  const say = (s) => { statusEl.textContent = s; };
+  const err = (s) => { msgEl.textContent = s; };
+
+  const M = await createGBA();
+  const api = {
+    init: M.cwrap('vj_init', 'number', []),
+    loadRom: M.cwrap('vj_load_rom', 'number', ['number', 'number']),
+    loaded: M.cwrap('vj_loaded', 'number', []),
+    reset: M.cwrap('vj_reset', null, []),
+    runFrame: M.cwrap('vj_run_frame', null, []),
+    framebuffer: M.cwrap('vj_framebuffer', 'number', []),
+    width: M.cwrap('vj_width', 'number', []),
+    height: M.cwrap('vj_height', 'number', []),
+    frameCounter: M.cwrap('vj_frame_counter', 'number', []),
+    opaque: M.cwrap('vj_opaque', null, []),
+    setKeys: M.cwrap('vj_set_keys', null, ['number']),
+    sampleRate: M.cwrap('vj_sample_rate', 'number', []),
+    audioBuffer: M.cwrap('vj_audio_buffer', 'number', []),
+    drainAudio: M.cwrap('vj_drain_audio', 'number', ['number']),
+    saveBuffer: M.cwrap('vj_save_buffer', 'number', []),
+    saveSize: M.cwrap('vj_save_size', 'number', []),
+    saveHash: M.cwrap('vj_save_hash', 'number', []),
+    saveRestore: M.cwrap('vj_save_restore', 'number', ['number', 'number']),
+    saveType: M.cwrap('vj_save_type', 'number', []),
+    saveMediaSize: M.cwrap('vj_save_media_size', 'number', []),
+    stateSize: M.cwrap('vj_state_size', 'number', []),
+    stateSave: M.cwrap('vj_state_save', 'number', []),
+    stateLoad: M.cwrap('vj_state_load', 'number', ['number', 'number']),
+    read8: M.cwrap('vj_read8', 'number', ['number']),
+    read16: M.cwrap('vj_read16', 'number', ['number']),
+    read32: M.cwrap('vj_read32', 'number', ['number']),
+    meanLuma: M.cwrap('vj_mean_luma', 'number', []),
+    frameHash: M.cwrap('vj_frame_hash', 'number', []),
+    title: M.cwrap('vj_game_title', 'string', []),
+    code: M.cwrap('vj_game_code', 'string', []),
+    revision: M.cwrap('vj_rom_revision', 'number', []),
+    romSize: M.cwrap('vj_rom_size', 'number', [])
+  };
+
+  if (!api.init()) { err('emulator core failed to initialise'); return; }
+
+  const W = api.width(), H = api.height();
+  cv.width = W; cv.height = H;
+  const img = ctx.createImageData(W, H);
+  const fbPtr = api.framebuffer();
+
+  /* --------------------------------------------------------------- storage */
+  const DB = 'mzm-web', DBV = 1;
+  function idb() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open(DB, DBV);
+      r.onupgradeneeded = () => {
+        const db = r.result;
+        if (!db.objectStoreNames.contains('rom')) db.createObjectStore('rom');
+        if (!db.objectStoreNames.contains('sram')) db.createObjectStore('sram');
+      };
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }
+  async function put(store, key, val) {
+    const db = await idb();
+    return new Promise((res, rej) => {
+      const t = db.transaction(store, 'readwrite');
+      t.objectStore(store).put(val, key);
+      t.oncomplete = () => { db.close(); res(true); };
+      t.onerror = () => { db.close(); rej(t.error); };
+    });
+  }
+  async function get(store, key) {
+    const db = await idb();
+    return new Promise((res, rej) => {
+      const t = db.transaction(store, 'readonly');
+      const rq = t.objectStore(store).get(key);
+      rq.onsuccess = () => { db.close(); res(rq.result); };
+      rq.onerror = () => { db.close(); rej(rq.error); };
+    });
+  }
+  async function del(store, key) {
+    const db = await idb();
+    return new Promise((res) => {
+      const t = db.transaction(store, 'readwrite');
+      t.objectStore(store).delete(key);
+      t.oncomplete = () => { db.close(); res(true); };
+      t.onerror = () => { db.close(); res(false); };
+    });
+  }
+
+  /* ----------------------------------------------------------------- state */
+  let running = false, paused = false, gameCode = null;
+  let lastSaveHash = 0, flushes = 0, lastFlushAt = 0, lastRestore = null;
+
+  function sramKey() { return 'sram:' + (gameCode || 'unknown'); }
+
+  async function flushSave(why) {
+    if (!api.loaded() || !gameCode) return false;
+    if (NO_FLUSH) { return false; }
+    const h = api.saveHash();
+    if (h === lastSaveHash && why !== 'force') return false;
+    const p = api.saveBuffer(), n = api.saveSize();
+    const bytes = new Uint8Array(M.HEAPU8.subarray(p, p + n));  // copy, not a view
+    await put('sram', sramKey(), bytes);
+    lastSaveHash = h; flushes++; lastFlushAt = Date.now();
+    return true;
+  }
+
+  /* Save-out paths, in order of how reliable they are in practice:
+     a hash-change poll (survives a crash or a kill), visibilitychange, and
+     pagehide. `beforeunload` is deliberately NOT the only one -- on a real
+     navigation it is a race against the tab dying. */
+  if (!NO_FLUSH) {
+    setInterval(() => { flushSave('poll'); }, 1500);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushSave('hidden');
+    });
+    window.addEventListener('pagehide', () => { flushSave('pagehide'); });
+    window.addEventListener('beforeunload', () => { flushSave('beforeunload'); });
+  } else {
+    console.log('mzm: save flushing DISABLED (?nosaveflush=1) -- negative control');
+  }
+
+  /* ----------------------------------------------------------------- input */
+  const KEY = { A: 1, B: 2, SELECT: 4, START: 8, RIGHT: 16, LEFT: 32, UP: 64, DOWN: 128, R: 256, L: 512 };
+  const MAP = {
+    ArrowRight: KEY.RIGHT, ArrowLeft: KEY.LEFT, ArrowUp: KEY.UP, ArrowDown: KEY.DOWN,
+    KeyX: KEY.A, KeyZ: KEY.B, KeyA: KEY.L, KeyS: KEY.R,
+    Enter: KEY.START, ShiftLeft: KEY.SELECT, ShiftRight: KEY.SELECT
+  };
+  let kbMask = 0, testMask = 0;
+  addEventListener('keydown', (e) => {
+    if (e.code === 'KeyP') { togglePause(); e.preventDefault(); return; }
+    if (MAP[e.code] !== undefined) { kbMask |= MAP[e.code]; e.preventDefault(); }
+  });
+  addEventListener('keyup', (e) => {
+    if (MAP[e.code] !== undefined) { kbMask &= ~MAP[e.code]; e.preventDefault(); }
+  });
+  addEventListener('blur', () => { kbMask = 0; });
+
+  const PAD = [KEY.A, KEY.B, KEY.SELECT, KEY.START, 0, 0, KEY.L, KEY.R,
+    0, 0, 0, 0, KEY.UP, KEY.DOWN, KEY.LEFT, KEY.RIGHT];
+  function padMask() {
+    const ps = navigator.getGamepads ? navigator.getGamepads() : [];
+    let m = 0;
+    for (const p of ps) {
+      if (!p) continue;
+      p.buttons.forEach((b, i) => { if (b.pressed && PAD[i]) m |= PAD[i]; });
+      if (p.axes[0] < -0.4) m |= KEY.LEFT; if (p.axes[0] > 0.4) m |= KEY.RIGHT;
+      if (p.axes[1] < -0.4) m |= KEY.UP; if (p.axes[1] > 0.4) m |= KEY.DOWN;
+    }
+    return m;
+  }
+
+  /* ----------------------------------------------------------------- audio */
+  let ac = null, acNode = null;
+  function soundOn() {
+    if (ac) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    ac = new AC({ sampleRate: api.sampleRate() });
+    const n = ac.createScriptProcessor ? ac.createScriptProcessor(1024, 0, 2) : null;
+    if (!n) { return; }
+    const bufPtr = api.audioBuffer();
+    n.onaudioprocess = (e) => {
+      const L = e.outputBuffer.getChannelData(0), R = e.outputBuffer.getChannelData(1);
+      const want = L.length;
+      const got = api.drainAudio(want);
+      const h = M.HEAP16.subarray(bufPtr >> 1, (bufPtr >> 1) + got * 2);
+      for (let i = 0; i < want; i++) {
+        if (i < got) { L[i] = h[i * 2] / 32768; R[i] = h[i * 2 + 1] / 32768; }
+        else { L[i] = 0; R[i] = 0; }
+      }
+    };
+    n.connect(ac.destination);
+    acNode = n;
+    document.getElementById('sound').textContent = 'Sound: on';
+  }
+
+  /* ------------------------------------------------------------------ loop */
+  let acc = 0, last = 0;
+  const FRAME_MS = 1000 / 59.7275;
+  function loop(t) {
+    requestAnimationFrame(loop);
+    if (!running || paused) { last = t; return; }
+    if (!last) last = t;
+    acc += t - last; last = t;
+    if (acc > 200) acc = 200;              // don't try to catch up after a stall
+    let n = 0;
+    while (acc >= FRAME_MS && n < 4) {
+      api.setKeys(kbMask | testMask | padMask());
+      api.runFrame();
+      acc -= FRAME_MS; n++;
+    }
+    if (n) {
+      api.opaque();
+      img.data.set(M.HEAPU8.subarray(fbPtr, fbPtr + W * H * 4));
+      ctx.putImageData(img, 0, 0);
+    }
+  }
+  requestAnimationFrame(loop);
+
+  function togglePause() {
+    if (!running) return;
+    paused = !paused;
+    document.getElementById('pause').textContent = paused ? 'Resume' : 'Pause';
+  }
+
+  /* ------------------------------------------------------------- rom intake */
+  async function start(bytes, cache) {
+    err('');
+    const p = M._malloc(bytes.length);
+    M.HEAPU8.set(bytes, p);
+    // Peek at the header before committing: the save buffer here is sized for
+    // Zero Mission's 32 KiB SRAM, so another game would get the wrong media.
+    const title = String.fromCharCode.apply(null, bytes.subarray(0xA0, 0xAC)).replace(/\0+$/, '');
+    const code = String.fromCharCode.apply(null, bytes.subarray(0xAC, 0xB0));
+    if (!/^ZEROMISSION/.test(title)) {
+      M._free(p);
+      err('that does not look like Metroid: Zero Mission (header says "' +
+        title + '" / ' + code + ')');
+      return false;
+    }
+    gameCode = code;
+
+    // Restore the cartridge save BEFORE loadROM: mGBA reads the buffer when it
+    // attaches the save media, so restoring afterwards would be ignored.
+    const prior = await get('sram', sramKey()).catch(() => null);
+    if (prior && prior.byteLength) {
+      const b = new Uint8Array(prior);
+      const sp = M._malloc(b.length);
+      M.HEAPU8.set(b, sp);
+      api.saveRestore(sp, b.length);
+      M._free(sp);
+      // Record what we handed over, hashed the same way the test hashes the
+      // stored blob. Reading the core's save back after the fact would be a
+      // race: the game rewrites SRAM within a dozen frames of boot.
+      let h = 2166136261;
+      for (let i = 0; i < b.length; i++) { h = ((h ^ b[i]) * 16777619) >>> 0; }
+      lastRestore = { len: b.length, hash: h };
+    } else {
+      lastRestore = null;
+    }
+
+    const ok = api.loadRom(p, bytes.length);
+    M._free(p);
+    if (!ok) { err('the core refused that file'); return false; }
+
+    lastSaveHash = api.saveHash();
+    if (cache) { put('rom', 'rom', new Uint8Array(bytes)).catch(() => {}); }
+
+    overlay.classList.add('gone');
+    running = true; paused = false;
+    for (const id of ['pause', 'reset', 'sound', 'savestate', 'loadstate']) {
+      document.getElementById(id).disabled = false;
+    }
+    say(api.title().slice(0, 12).trim() + ' · ' + gameCode + ' · rev ' + api.revision());
+    console.log('mzm: started ' + api.title() + ' rev' + api.revision() +
+      ' ' + api.romSize() + ' bytes');
+    return true;
+  }
+
+  document.getElementById('rom').addEventListener('change', async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    start(new Uint8Array(await f.arrayBuffer()), true);
+  });
+  addEventListener('dragover', (e) => { e.preventDefault(); });
+  addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) start(new Uint8Array(await f.arrayBuffer()), true);
+  });
+
+  document.getElementById('pause').onclick = togglePause;
+  document.getElementById('reset').onclick = () => { api.reset(); };
+  document.getElementById('sound').onclick = soundOn;
+  document.getElementById('forget').onclick = async () => {
+    await del('rom', 'rom');
+    say('stored ROM cleared');
+  };
+  document.getElementById('savestate').onclick = async () => {
+    const n = api.stateSize(), p = api.stateSave();
+    if (!p || !n) return;
+    await put('sram', 'state:' + gameCode, new Uint8Array(M.HEAPU8.subarray(p, p + n)));
+    say('state saved');
+  };
+  document.getElementById('loadstate').onclick = async () => {
+    const v = await get('sram', 'state:' + gameCode).catch(() => null);
+    if (!v) { say('no saved state'); return; }
+    const b = new Uint8Array(v);
+    const p = M._malloc(b.length); M.HEAPU8.set(b, p);
+    const ok = api.stateLoad(p, b.length); M._free(p);
+    say(ok ? 'state loaded' : 'state did not match this build');
+  };
+
+  /* Offer the cached ROM back so a reload does not re-prompt. */
+  (async function () {
+    const v = await get('rom', 'rom').catch(() => null);
+    if (!v || !v.byteLength) return;
+    if (AUTOSTART) { start(new Uint8Array(v), false); return; }
+    const b = document.createElement('button');
+    b.textContent = 'Resume with the ROM stored in this browser';
+    b.onclick = () => start(new Uint8Array(v), false);
+    overlay.appendChild(b);
+  })();
+
+  /* ------------------------------------------------- test-harness surface
+   * Read-only probes plus key edges. The harness owns the state machine and
+   * the symbol table; this page deliberately knows nothing about either.
+   */
+  window.__mzm = {
+    nonce: q.get('_n') || null,
+    ready: true,
+    get started() { return !!api.loaded(); },
+    get paused() { return paused; },
+    frames: () => api.frameCounter(),
+    setKeys: (m) => { testMask = m | 0; return testMask; },
+    read8: (a) => api.read8(a), read16: (a) => api.read16(a), read32: (a) => api.read32(a),
+    meanLuma: () => api.meanLuma(),
+    frameHash: () => api.frameHash(),
+    canvasSize: () => {
+      const r = cv.getBoundingClientRect();
+      return { attr: [cv.width, cv.height], css: [Math.round(r.width), Math.round(r.height)] };
+    },
+    /* Measured from the 2D canvas, i.e. from what was actually painted, as a
+       cross-check on the wasm-side luma. Both can be fooled; the driver's own
+       screenshot is the ground truth and the harness scores that too. */
+    canvasLuma: () => {
+      const c = document.createElement('canvas');
+      c.width = W; c.height = H;
+      const g = c.getContext('2d');
+      g.drawImage(cv, 0, 0);
+      const d = g.getImageData(0, 0, W, H).data;
+      let acc = 0;
+      for (let i = 0; i < W * H; i++) {
+        acc += 0.2126 * d[i * 4] + 0.7152 * d[i * 4 + 1] + 0.0722 * d[i * 4 + 2];
+      }
+      return acc / (W * H);
+    },
+    header: () => ({ title: api.title(), code: api.code(), revision: api.revision(),
+                     size: api.romSize() }),
+    save: () => ({ hash: api.saveHash(), size: api.saveSize(),
+                   type: api.saveType(), mediaSize: api.saveMediaSize(),
+                   flushes: flushes, lastFlushAt: lastFlushAt,
+                   flushingDisabled: NO_FLUSH }),
+    flushSave: () => flushSave('force'),
+    restored: () => lastRestore,
+    saveBytes: () => {
+      const p = api.saveBuffer(), n = api.saveSize();
+      return Array.from(M.HEAPU8.subarray(p, p + 64)).concat([n]);
+    },
+    /* Read the store directly. Used on a fresh load BEFORE any ROM is picked,
+       so nothing is running that could rewrite the thing being measured. */
+    idbSave: async () => {
+      const dbs = await indexedDB.databases();
+      const names = dbs.map((d) => String(d.name));
+      if (!names.includes(DB)) return { db: null, names: names, files: {} };
+      const db = await idb();
+      const out = {};
+      await new Promise((res) => {
+        const t = db.transaction('sram', 'readonly');
+        const rq = t.objectStore('sram').openCursor();
+        rq.onsuccess = () => {
+          const c = rq.result;
+          if (!c) { res(); return; }
+          const v = c.value;
+          out[c.key] = v && v.byteLength !== undefined ? v.byteLength : -1;
+          c.continue();
+        };
+        rq.onerror = () => res();
+      });
+      db.close();
+      return { db: DB, names: names, files: out };
+    },
+    idbSaveHash: async (key) => {
+      const v = await get('sram', key || sramKey()).catch(() => null);
+      if (!v) return null;
+      const b = new Uint8Array(v);
+      let h = 2166136261;
+      for (let i = 0; i < b.length; i++) { h = ((h ^ b[i]) * 16777619) >>> 0; }
+      return { len: b.length, hash: h };
+    },
+    audioContexts: () => window.__mzmAudioCtxCount,
+    netBlocked: () => window.__mzmNet.slice(),
+    gameCode: () => gameCode
+  };
+  console.log('mzm: page ready (nonce=' + window.__mzm.nonce + ')');
+})();
+</script>
+</body>
+</html>

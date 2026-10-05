@@ -1,0 +1,42 @@
+# No ROMs, and nothing extracted from one, ever enters this repository.
+*.nes
+*.gb
+*.gbc
+*.sfc
+*.smc
+*.md
+*.gba
+*.z64
+*.iso
+*.gcm
+*.rvz
+baserom*
+*_baserom.gba
+
+# ...but keep the written docs, which the *.md rule above would otherwise eat.
+!STATUS.md
+!notes/*.md
+
+# Everything the extractor pulls out of the user's own cartridge dump at build
+# time. These are the game's graphics, tilemaps, room data and sound samples.
+upstream/mzm/data/
+upstream/mzm/include/extracted/
+upstream/mzm/sound/direct_sound_samples/
+
+# Build output
+upstream/mzm/*.elf
+upstream/mzm/*.map
+upstream/mzm/*.dump
+upstream/mzm/linker.ld.pp
+upstream/mzm/tools/agbcc/
+toolchain/
+ref/mgba/build-wasm/
+web/dist/
+web/gen/
+web/test/core-node.js
+web/test/core-node.wasm
+out/
+__pycache__/
+*.pyc
+*.o
+*.a
